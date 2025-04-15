@@ -1,1 +1,10 @@
-fix-nara-commie-bullshit
+apario-writer-html2csv
+*.log
+pdfs/*
+logs/*
+*.csv
+*.bak
+*.tar.gz
+jfkfiles/
+.idea
+summaries/
