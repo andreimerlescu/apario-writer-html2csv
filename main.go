@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -24,6 +23,7 @@ import (
 	"github.com/andreimerlescu/figtree/v2"
 	sema "github.com/andreimerlescu/go-sema"
 	"github.com/fatih/color"
+	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"golang.org/x/net/html"
 )
 
@@ -46,12 +46,12 @@ var sem sema.Semaphore // limit system runtime resources to prevent overload or 
 var figs figtree.Fruit // fun cli configuration utility with validators and callbacks
 
 const (
+	kImport    string = "import"    // path to import csv file ; used as -import -input -output
 	kInput     string = "input"     // path to input HTML file to parse
 	kOutput    string = "output"    // path to output csv file
 	kPDFs      string = "pdfs"      // path to downloaded PDFs
 	kDownloads string = "downloads" // concurrent downloads allowed
 	kErrorLog  string = "error_log" // path to error log file
-	kImport    string = "import"    // path to import csv file ; used as -import -input -output
 )
 
 // Row represents a single Record in the CSV Table
@@ -64,28 +64,17 @@ type Row struct {
 }
 
 func (row *Row) populatePages(ctx context.Context) error {
-	cmd := strings.Builder{}
-	cmd.WriteString(`page_count=$(pdfinfo "$pdf_path" | grep 'Pages:' | awk '{print $2}'); [ -z "$page_count" ] && page_count="Unknown"`)
-	info := exec.CommandContext(ctx, "sh", cmd.String())
-	info.Stderr = os.Stderr
-	info.Stdout = os.Stdout
-	out, err := info.Output()
+	handler, err := os.Open(row.PATH)
 	if err != nil {
 		return err
 	}
-	outStr := string(out)
-	if strings.Contains(outStr, "Unknown") {
-		return fmt.Errorf("unknown page count")
-	}
-	pages, err := strconv.Atoi(outStr)
+
+	info, err := api.PDFInfo(handler, row.PATH, nil, nil)
 	if err != nil {
 		return err
 	}
-	if pages > 0 {
-		row.PAGES = strconv.Itoa(pages)
-		return nil
-	}
-	return fmt.Errorf("zero pages in pdf %s", row.FILENAME)
+	row.PAGES = strconv.FormatInt(int64(info.PageCount), 10)
+	return nil
 }
 
 // TableHeaders define the -import headers that apario-writer requires for its CSV import
@@ -243,7 +232,7 @@ func main() {
 	errChan := make(chan DownloadResult, len(records))
 	doneChan := make(chan struct{})
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGKILL)
 
 	// Schedule all downloads
 	wg := sync.WaitGroup{}
@@ -252,7 +241,7 @@ func main() {
 		go func(r Record) {
 			defer wg.Done()
 			err := r.downloadURL(ctx)
-			errChan <- DownloadResult{Record: Record{URL: r.URL}, Err: err}
+			errChan <- DownloadResult{Record: r, Err: err}
 		}(record)
 	}
 
