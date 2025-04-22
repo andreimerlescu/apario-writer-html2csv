@@ -6,5 +6,6 @@ logs/*
 *.bak
 *.tar.gz
 jfkfiles/
-.idea
+.idea/
+config.yml
 summaries/

@@ -46,12 +46,12 @@ var sem sema.Semaphore // limit system runtime resources to prevent overload or 
 var figs figtree.Fruit // fun cli configuration utility with validators and callbacks
 
 const (
-	kImport    string = "import"    // path to import csv file ; used as -import -input -output
-	kInput     string = "input"     // path to input HTML file to parse
-	kOutput    string = "output"    // path to output csv file
-	kPDFs      string = "pdfs"      // path to downloaded PDFs
-	kDownloads string = "downloads" // concurrent downloads allowed
-	kErrorLog  string = "error_log" // path to error log file
+	kImport       string = "import"        // path to import csv file ; used as -import -input -output
+	kImportPrefix string = "import-prefix" // prefix path to ignore when looking at -pdfs
+	kInput        string = "input"         // path to input HTML file to parse
+	kOutput       string = "output"        // path to output csv file
+	kPDFs         string = "pdfs"          // path to downloaded PDFs
+	kDownloads    string = "downloads"     // concurrent downloads allowed
 )
 
 // Row represents a single Record in the CSV Table
@@ -86,65 +86,56 @@ type Table struct {
 	Rows    []Row
 }
 
-func init() {
-	figs = figtree.Grow()
-	figs.NewString(kInput, "./input.html", "Path to input HTML file to parse")
-	figs.WithValidator(kInput, figtree.AssureStringNotEmpty)
-	figs.NewString(kOutput, "./output.csv", "Path to the output CSV file")
-	figs.WithValidator(kOutput, figtree.AssureStringNotEmpty)
-	figs.NewString(kImport, "./import.csv", "Path to the import CSV file to append results in new output.csv")
-	figs.WithValidator(kImport, figtree.AssureStringNotEmpty)
-	figs.NewString(kPDFs, "./pdfs/", "Path to downloaded PDFs")
-	figs.WithValidator(kPDFs, figtree.AssureStringNotEmpty)
-	figs.NewInt(kDownloads, 9, "Concurrent downloads to allow")
-	figs.WithValidator(kDownloads, figtree.AssureIntInRange(3, 17))
-	figs.NewString(kErrorLog, "./error.log", "Path to error log file")
-	figs.WithValidator(kErrorLog, figtree.AssureStringNotEmpty)
-	figs.WithCallback(kErrorLog, figtree.CallbackAfterVerify, func(value interface{}) error {
-		path, ok := value.(string)
-		if !ok {
-			_path, ok := value.(*string)
-			if !ok {
-				return fmt.Errorf("value is not a string")
-			}
-			path = *_path
-		}
-		if err := check.File(path, file.Options{Exists: true, Create: file.Create{
-			Kind:     file.IfNotExists,
-			OpenFlag: os.O_CREATE | os.O_TRUNC | os.O_RDWR,
-			FileMode: 0644,
-		}}); err != nil {
-			return err
-		}
-		return nil
-	})
-	if err := figs.Load(); err != nil {
-		log.Fatalf("error loading config: %v", err)
-	}
-}
+var configFile = filepath.Join(".", "config.yml")
 
 func main() {
+	color.Green("Welcome to Apario Writer HTML➜CSV Utility")
+	figs = figtree.With(figtree.Options{
+		ConfigFile:        configFile,
+		Tracking:          false,
+		Germinate:         true,
+		Pollinate:         false,
+		IgnoreEnvironment: true,
+	})
+	figs.NewString(kInput, "./input.html", "Path to input HTML file to parse")
+	figs.NewString(kOutput, "./output.csv", "Path to the output CSV file")
+	figs.NewString(kImport, "./import.csv", "Path to the import CSV file to append results in new output.csv")
+	figs.NewString(kImportPrefix, "", "Path prefix for -import to arrive at -pdfs as . context")
+	figs.NewString(kPDFs, "./pdfs/", "Path to downloaded PDFs")
+	figs.NewInt(kDownloads, 9, "Concurrent downloads to allow")
+	figs.WithValidator(kDownloads, figtree.AssureIntInRange(3, 17))
+	if _, err := os.Stat(configFile); os.IsNotExist(err) {
+		if err2 := figs.Parse(); err2 != nil {
+			color.Red("No file loaded %s and parse failed: %v", configFile, err2)
+			os.Exit(1)
+		}
+	} else {
+		if err := figs.Load(); err != nil {
+			color.Red("Error loading config file: %v", err)
+			os.Exit(1)
+		}
+	}
+	color.Green("Loaded configurations!")
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Set up error logger
-	errorLogPath := *figs.String(kErrorLog)
-	logFile, err := os.OpenFile(errorLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatalf("Failed to open error log file %s: %v", errorLogPath, err)
-	}
-	defer logFile.Close()
-	logger := log.New(logFile, "", log.LstdFlags)
 
 	// Validate downloads concurrency
 	if *figs.Int(kDownloads) <= 0 {
-		logger.Fatal("Concurrent downloads must be positive")
+		log.Fatal("Concurrent downloads must be positive")
 	}
+	color.Green("We're limiting downloads to %d", *figs.Int(kDownloads))
 	sem = sema.New(*figs.Int(kDownloads))
 
 	// Check input file
 	if *figs.String(kInput) == "" {
-		logger.Fatal("Input HTML file path is required. Use -input flag.")
+		log.Fatal("Input HTML file path is required. Use -input flag.")
 	}
+	color.Green("Arguments Provided:")
+	color.Green("➜   -%s %s", kInput, *figs.String(kInput))
+	color.Green("➜   -%s %s", kInput, *figs.String(kImport))
+	color.Green("➜   -%s %s", kImportPrefix, *figs.String(kImportPrefix))
+	color.Green("➜   -%s %s", kOutput, *figs.String(kOutput))
 
 	finalTable := Table{}             // where we gather the Record DownloadResults into
 	finalTable.Headers = TableHeaders // capture the headers needed in the new output
@@ -152,40 +143,52 @@ func main() {
 	lastID := atomic.Int64{}
 	yah := ""
 	if len(*figs.String(kImport)) > 0 {
+		color.Green("Reading file %s", *figs.String(kImport))
 		importBytes, err := os.ReadFile(*figs.String(kImport)) // get the bytes from the file
 		if err != nil {
-			logger.Fatal(err)
+			log.Fatal(err)
 		}
+		color.Green("Finding records in CSV file...")
 		records, err := csv.NewReader(bytes.NewReader(importBytes)).ReadAll() // read the records in the file
 		if err != nil {
-			logger.Fatal(err)
+			log.Fatal(err)
 		}
+		color.Green("Found %d records inside %s", len(records), *figs.String(kImport))
 		for _, record := range records { // iterate over the lines
 			if l := len(record); l != 5 {
-				logger.Printf("Skipping over row due to columns != 5; got = %d", l)
+				color.Yellow("Skipping over row due to columns != 5; got = %d", l)
 				continue
 			}
-			row := Row{}                                            // create a new row
-			row.ID = record[0]                                      // first column is the ID
-			thisID := new(int64)                                    // prepare a new ID placeholder
-			items, err := fmt.Sscanf(row.ID, "%s-%d", &yah, thisID) // scan the JFKFILES-0001 integer out
+			if record[0] == "ID" && record[1] == "URL" && record[2] == "PATH" && record[3] == "FILENAME" && record[4] == "PAGES" {
+				color.Yellow("Skipping the header row...")
+				continue
+			}
+			color.Green("Processing record %+v", record)
+			row := Row{}                                             // create a new row
+			row.ID = record[0]                                       // first column is the ID
+			thisID := new(int64)                                     // prepare a new ID placeholder
+			items, err := fmt.Sscanf(row.ID, "%s-%4d", &yah, thisID) // scan the JFKFILES-0001 integer out
 			if err != nil {
-				logger.Println(err)
+				log.Println(err)
 			}
 			if items == 1 && *thisID > lastID.Load() { // if we captured thisID and its greater than lastID
-				color.Green("Got new lastID = %d ➜ %d", lastID, *thisID)
+				color.Blue("Got new lastID = %d ➜ %d", lastID.Load(), *thisID)
 				lastID.Store(*thisID) // update the new value
 			}
-			row.URL = record[1]                         // url may have prexif on it or not
+			row.URL = record[1]                         // url may have prefix on it or not
 			if !strings.HasPrefix(row.URL, prefixUrl) { // if it doesnt
 				row.URL = prefixUrl + row.URL // add it
 			}
 			row.PATH = record[2]
+			if s := *figs.String(kImportPrefix); len(s) > 0 {
+				s := strings.Clone(s)
+				row.PATH = strings.ReplaceAll(row.PATH, s, ``)
+			}
 			if !strings.HasPrefix(row.PATH, *figs.String(kPDFs)) {
 				color.Red("PATH record indicates mismatching directory for -pdfs due to:\n\n"+
 					"row.PATH = %s\n"+
 					"-pdfs = %s", row.PATH, *figs.String(kPDFs))
-				logger.Fatal("cannot use -pdfs in this manner with -import")
+				log.Fatal("cannot use -pdfs in this manner with -import")
 			}
 			row.FILENAME = record[3]
 			checkPath := filepath.Base(row.PATH)
@@ -194,14 +197,14 @@ func main() {
 					"row.PATH = %s\n"+
 					"row.FILENAME = %s\n"+
 					"-pdfs = %s", row.PATH, row.FILENAME, *figs.String(kPDFs))
-				logger.Fatal("cannot use -pdfs in this manner with -import")
+				log.Fatal("cannot use -pdfs in this manner with -import")
 			}
 			row.PAGES = record[4]
 			pages, _ := strconv.Atoi(row.PAGES)
 			if pages == 0 {
 				err := row.populatePages(ctx)
 				if err != nil {
-					logger.Println(err)
+					log.Println(err)
 				}
 			}
 			ftMutex.Lock()
@@ -210,22 +213,32 @@ func main() {
 		}
 	}
 
+	color.Green("Finished importing %d records from -import %s", len(finalTable.Rows), *figs.String(kImport))
+
 	// Read HTML file
+	color.Green("Reading file %s", *figs.String(kInput))
 	htmlContent, err := os.ReadFile(*figs.String(kInput))
 	if err != nil {
-		logger.Fatalf("Failed to read HTML file %s: %v", *figs.String(kInput), err)
+		log.Fatalf("Failed to read HTML file %s: %v", *figs.String(kInput), err)
 	}
 
 	// Parse HTML
+	color.Green("Parsing HTML input file...")
 	records, err := parseHTML(string(htmlContent))
 	if err != nil {
-		logger.Fatalf("Failed to parse HTML: %v", err)
+		log.Fatalf("Failed to parse HTML: %v", err)
 	}
+	color.Green("Found %d records in HTML file", len(records))
 
 	// Create PDFs directory
 	pdfDir := *figs.String(kPDFs)
-	if err := os.MkdirAll(pdfDir, 0755); err != nil {
-		logger.Fatalf("Failed to create PDFs directory %s: %v", pdfDir, err)
+	_, pdfDirErr := os.Stat(pdfDir)
+	if os.IsNotExist(pdfDirErr) {
+		color.Yellow("Directory %s does not exist... creating directory now...", pdfDir)
+		if err := os.MkdirAll(pdfDir, 0755); err != nil {
+			log.Fatalf("Failed to create PDFs directory %s: %v", pdfDir, err)
+		}
+		color.Green("Created directory %s", pdfDir)
 	}
 
 	// Set up context and channels
@@ -240,15 +253,22 @@ func main() {
 		wg.Add(1)
 		go func(r Record) {
 			defer wg.Done()
+			color.Green("Downloading file %s", record.Filename)
 			err := r.downloadURL(ctx)
+			if err != nil {
+				color.Red("Download err: %v", err)
+			}
 			errChan <- DownloadResult{Record: r, Err: err}
 		}(record)
 	}
 
 	// Wait for all downloads to complete
 	go func() {
+		color.Yellow("Waiting for all downloads to complete...")
 		wg.Wait()
+		color.Yellow("Closing the results channel...")
 		close(errChan)
+		color.Yellow("Writing into the done channel...")
 		doneChan <- struct{}{}
 	}()
 
@@ -256,16 +276,18 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Println("Context canceled, exiting...")
+			color.Yellow("Context canceled, exiting...")
 			os.Exit(1)
 		case <-doneChan:
 			// Process all download results
+			color.Yellow("Receiving downloaded results...")
 			var failedURLs []string
 			wg := sync.WaitGroup{}
 			for result := range errChan {
+				color.Green("Download result received...")
 				if result.Err != nil {
 					failedURLs = append(failedURLs, result.Record.URL)
-					logger.Printf("Error downloading %s: %v", result.Record.URL, result.Err)
+					color.Red("Error downloading %s: %v", result.Record.URL, result.Err)
 				}
 				wg.Add(1)
 				go func(wg *sync.WaitGroup, result DownloadResult) {
@@ -281,9 +303,11 @@ func main() {
 						color.Red(err.Error())
 						return
 					}
+					color.Green("Adding row to finalTable")
 					ftMutex.Lock()
 					finalTable.Rows = append(finalTable.Rows, row)
 					ftMutex.Unlock()
+					color.Green("Finished downloading %s", result.Record.URL)
 
 				}(&wg, result)
 			}
@@ -296,16 +320,17 @@ func main() {
 			} else {
 				color.Green("All downloads completed successfully.")
 			}
+			color.Green("Writing %d rows to %s", len(finalTable.Rows), *figs.String(kOutput))
 			ftMutex.Lock()
 			if err := writeCSV(*figs.String(kOutput), finalTable.Rows); err != nil {
 				ftMutex.Unlock()
-				logger.Fatalf("Failed to write CSV: %v", err)
+				log.Fatalf("Failed to write CSV: %v", err)
 			}
 			ftMutex.Unlock()
 			fmt.Printf("Successfully wrote %d records to %s\n", len(finalTable.Rows), *figs.String(kOutput))
 			return
 		case sig := <-sigChan:
-			logger.Printf("Received signal %v, shutting down...", sig)
+			log.Printf("Received signal %v, shutting down...", sig)
 			cancel()
 			os.Exit(1)
 		}
